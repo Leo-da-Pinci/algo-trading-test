@@ -1,200 +1,266 @@
 """
 Backtester Module
-Runs the Turtle Trading system on historical data.
-Simulates trades, tracks P&L, and calculates performance metrics.
+Simulates Turtle Trading strategy on historical data.
+Tracks entries, exits, pyramids, P&L, and performance metrics.
 """
 
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from data_fetcher import DataFetcher
-from signals import TurtleSignals
-from position_sizing import PositionSizer
+
+
+class Position:
+    """Represents a single open position."""
+    
+    def __init__(self, commodity, entry_date, entry_price, units, n, stop_price):
+        self.commodity = commodity
+        self.entry_date = entry_date
+        self.entry_price = entry_price
+        self.units = units
+        self.n = n
+        self.stop_price = stop_price
+        self.exit_date = None
+        self.exit_price = None
+        self.exit_type = None  # 'stop', 'exit_signal', 'manual'
+        self.pyramid_count = 1
+    
+    def update_stop(self, new_stop):
+        """Update stop loss (trailing stop)."""
+        self.stop_price = max(self.stop_price, new_stop)
+    
+    def close(self, exit_date, exit_price, exit_type='stop'):
+        """Close the position."""
+        self.exit_date = exit_date
+        self.exit_price = exit_price
+        self.exit_type = exit_type
+    
+    def pnl(self):
+        """Calculate P&L if closed."""
+        if self.exit_price is None:
+            return None
+        return (self.exit_price - self.entry_price) * self.units
+    
+    def pnl_pct(self):
+        """Calculate P&L %."""
+        if self.exit_price is None:
+            return None
+        return ((self.exit_price - self.entry_price) / self.entry_price) * 100
 
 
 class TurtleBacktester:
-    """Backtest the Turtle Trading system on commodity futures."""
+    """Backtest Turtle Trading strategy on historical data."""
     
-    def __init__(self, account_size=1000000, risk_percent=2.0, commission_per_trade=0):
+    def __init__(self, signals_dict, account_size=1_000_000, risk_percent=2.0):
         """
         Initialize backtester.
         
         Args:
+            signals_dict (dict): {commodity: TurtleSignals object}
             account_size (float): Starting capital
-            risk_percent (float): Risk per trade (default 2%)
-            commission_per_trade (float): Commission per trade (optional)
+            risk_percent (float): Risk per trade (%)
         """
-        self.initial_account = account_size
-        self.current_account = account_size
+        self.signals_dict = signals_dict
+        self.account_size = account_size
         self.risk_percent = risk_percent
-        self.commission = commission_per_trade
+        self.risk_per_trade = account_size * (risk_percent / 100.0)
         
-        self.sizer = PositionSizer(account_size, risk_percent)
+        self.positions = []  # Closed positions
+        self.open_positions = {}  # {commodity: [Position]}
         self.trades = []
-        self.positions = {}
-        self.equity_curve = [account_size]
-        self.dates = []
     
-    def backtest_single_commodity(self, ticker, data, short_period=20, long_period=55):
-        """
-        Backtest a single commodity.
+    def get_contract_size(self, commodity):
+        """Return contract multiplier for commodity."""
+        contract_sizes = {
+            'Crude Oil': 1000,
+            'RBOB Gasoline': 42000,
+            'Gold': 100,
+            'Silver': 5000,
+            'Copper': 25000,
+            'Corn': 5000,
+            'Soybeans': 5000,
+            'Natural Gas': 10000,
+        }
+        return contract_sizes.get(commodity, 1)
+    
+    def backtest(self):
+        """Run the backtest."""
+        # Get list of dates (use first commodity's index)
+        first_commodity = list(self.signals_dict.keys())[0]
+        dates = self.signals_dict[first_commodity].signals.index
         
-        Args:
-            ticker (str): Commodity ticker
-            data (pd.DataFrame): OHLCV data
-            short_period (int): Short breakout period (20 for Turtle)
-            long_period (int): Long breakout period (55 for Turtle)
+        print(f"Backtesting from {dates[0].date()} to {dates[-1].date()}...")
         
-        Returns:
-            dict: Trade statistics for this commodity
-        """
-        signals = TurtleSignals(data)
-        signals.generate_full_signals(short_period, long_period)
+        for date in dates:
+            self._process_day(date)
         
-        trades = []
-        in_position = False
-        entry_bar_idx = None
-        entry_price = None
-        entry_contracts = 0
+        # Close any remaining open positions at last price
+        for commodity in list(self.open_positions.keys()):
+            for position in self.open_positions[commodity]:
+                if position.exit_date is None:
+                    last_close = self.signals_dict[commodity].signals.loc[dates[-1], 'close']
+                    position.close(dates[-1], last_close, exit_type='eod')
+                    self.positions.append(position)
         
-        for i in range(long_period, len(data)):
-            bar_date = data.index[i]
-            close = data['Close'].iloc[i]
-            low = data['Low'].iloc[i]
+        self._compile_results()
+        return self.trades
+    
+    def _process_day(self, date):
+        """Process one day of trading."""
+        for commodity, signals in self.signals_dict.items():
+            if date not in signals.signals.index:
+                continue
             
-            signal_row = signals.signals.iloc[i]
+            signal_row = signals.signals.loc[date]
+            close = signal_row['close']
+            high = self.signals_dict[commodity].data.loc[date, 'High']
+            low = self.signals_dict[commodity].data.loc[date, 'Low']
+            n = signal_row.get('N', np.nan)
             
-            # Exit logic: Close below 10-day low
-            if in_position and not pd.isna(signal_row['low_10']):
-                if close < signal_row['low_10']:
-                    exit_price = close
-                    pnl = (exit_price - entry_price) * self.sizer.contract_specs[ticker]['multiplier'] * entry_contracts
-                    
-                    trades.append({
-                        'ticker': ticker,
-                        'entry_date': data.index[entry_bar_idx],
-                        'entry_price': entry_price,
-                        'exit_date': bar_date,
-                        'exit_price': exit_price,
-                        'contracts': entry_contracts,
-                        'pnl': pnl,
-                        'pnl_percent': ((exit_price - entry_price) / entry_price) * 100 if entry_price != 0 else 0,
-                        'bars_held': i - entry_bar_idx,
-                    })
-                    
-                    in_position = False
-                    entry_price = None
-                    entry_bar_idx = None
-                    entry_contracts = 0
+            # Check stop losses first
+            self._check_stops(commodity, date, low)
             
-            # Entry logic: Close above 55-day high
-            if not in_position and signal_row['entry_55']:
-                entry_price = close
-                entry_bar_idx = i
-                n = signal_row['N']
-                
-                # Calculate position size
-                if pd.notna(n) and n > 0:
-                    sizing = self.sizer.calculate_units(entry_price, n, ticker)
-                    if sizing:
-                        in_position = True
-                        entry_contracts = sizing['contracts']
+            # Check for entry signals
+            if signal_row.get('entry_55', False) and n > 0:
+                self._enter_position(commodity, date, close, n)
+    
+    def _enter_position(self, commodity, date, entry_price, n):
+        """Enter a new position."""
+        contract_size = self.get_contract_size(commodity)
+        units = self.risk_per_trade / n
+        contracts = units / contract_size
+        
+        stop_price = entry_price - (2 * n)
+        
+        position = Position(
+            commodity=commodity,
+            entry_date=date,
+            entry_price=entry_price,
+            units=contracts,
+            n=n,
+            stop_price=stop_price
+        )
+        
+        if commodity not in self.open_positions:
+            self.open_positions[commodity] = []
+        
+        self.open_positions[commodity].append(position)
+    
+    def _check_stops(self, commodity, date, low):
+        """Check if any stops are hit."""
+        if commodity not in self.open_positions:
+            return
+        
+        remaining = []
+        for position in self.open_positions[commodity]:
+            if low <= position.stop_price:
+                # Stop hit
+                position.close(date, position.stop_price, exit_type='stop')
+                self.positions.append(position)
+            else:
+                remaining.append(position)
+        
+        self.open_positions[commodity] = remaining
+    
+    def _compile_results(self):
+        """Compile trade results."""
+        for position in self.positions:
+            if position.exit_price is not None:
+                self.trades.append({
+                    'commodity': position.commodity,
+                    'entry_date': position.entry_date,
+                    'entry_price': position.entry_price,
+                    'exit_date': position.exit_date,
+                    'exit_price': position.exit_price,
+                    'units': position.units,
+                    'pnl': position.pnl(),
+                    'pnl_pct': position.pnl_pct(),
+                    'exit_type': position.exit_type,
+                    'days_held': (position.exit_date - position.entry_date).days,
+                })
+    
+    def get_summary(self):
+        """Get backtest summary statistics."""
+        if not self.trades:
+            return {
+                'total_trades': 0,
+                'winning_trades': 0,
+                'losing_trades': 0,
+                'win_rate': 0,
+                'gross_pnl': 0,
+                'avg_pnl_per_trade': 0,
+                'profit_factor': 0,
+                'max_drawdown': 0,
+            }
+        
+        trades_df = pd.DataFrame(self.trades)
+        
+        winning = trades_df[trades_df['pnl'] > 0]
+        losing = trades_df[trades_df['pnl'] < 0]
+        
+        gross_wins = winning['pnl'].sum()
+        gross_losses = abs(losing['pnl'].sum())
         
         return {
-            'ticker': ticker,
-            'trades': trades,
-            'total_trades': len(trades),
-            'winning_trades': len([t for t in trades if t['pnl'] > 0]),
-            'losing_trades': len([t for t in trades if t['pnl'] < 0]),
-            'gross_pnl': sum(t['pnl'] for t in trades),
-            'avg_pnl_per_trade': np.mean([t['pnl'] for t in trades]) if trades else 0,
+            'total_trades': len(trades_df),
+            'winning_trades': len(winning),
+            'losing_trades': len(losing),
+            'win_rate': (len(winning) / len(trades_df) * 100) if len(trades_df) > 0 else 0,
+            'gross_pnl': trades_df['pnl'].sum(),
+            'avg_pnl_per_trade': trades_df['pnl'].mean(),
+            'profit_factor': gross_wins / gross_losses if gross_losses > 0 else 0,
+            'avg_winner': winning['pnl'].mean() if len(winning) > 0 else 0,
+            'avg_loser': losing['pnl'].mean() if len(losing) > 0 else 0,
         }
     
-    def backtest_portfolio(self, tickers, years=10, exclude_tickers=None):
-        """
-        Backtest multiple commodities as a portfolio.
+    def print_summary(self):
+        """Print summary to console."""
+        summary = self.get_summary()
         
-        Args:
-            tickers (list): List of commodity tickers
-            years (int): Years of historical data
-            exclude_tickers (list): Tickers to skip
-        
-        Returns:
-            dict: Portfolio performance metrics
-        """
-        exclude_tickers = exclude_tickers or []
-        fetcher = DataFetcher()
-        
-        all_results = {}
-        all_trades = []
-        
+        print("\n" + "=" * 80)
+        print("🦞 BACKTEST SUMMARY")
         print("=" * 80)
-        print("🦞 TURTLE TRADING BACKTEST")
+        print(f"Total Trades:       {summary['total_trades']}")
+        print(f"Winning Trades:     {summary['winning_trades']}")
+        print(f"Losing Trades:      {summary['losing_trades']}")
+        print(f"Win Rate:           {summary['win_rate']:.1f}%")
+        print(f"Gross P&L:          ${summary['gross_pnl']:,.0f}")
+        print(f"Avg P&L per Trade:  ${summary['avg_pnl_per_trade']:,.0f}")
+        print(f"Profit Factor:      {summary['profit_factor']:.2f}")
+        print(f"Avg Winner:         ${summary['avg_winner']:,.0f}")
+        print(f"Avg Loser:          ${summary['avg_loser']:,.0f}")
         print("=" * 80)
-        print(f"Account Size: ${self.initial_account:,.0f}")
-        print(f"Risk per Trade: {self.risk_percent}%")
-        print(f"Historical Period: {years} years")
-        print()
-        
-        for ticker in tickers:
-            if ticker in exclude_tickers:
-                continue
-            
-            print(f"Backtesting {ticker}...", end=" ", flush=True)
-            
-            # Fetch data
-            data = fetcher.fetch_commodity(ticker, years)
-            if data is None:
-                print("❌ Failed")
-                continue
-            
-            # Run backtest
-            result = self.backtest_single_commodity(ticker, data)
-            all_results[ticker] = result
-            all_trades.extend(result['trades'])
-            
-            print(f"✓ ({result['total_trades']} trades)")
-        
-        print()
-        print("=" * 80)
-        print("PORTFOLIO SUMMARY")
-        print("=" * 80)
-        
-        # Portfolio stats
-        total_trades = len(all_trades)
-        total_pnl = sum(t['pnl'] for t in all_trades)
-        winning_trades = len([t for t in all_trades if t['pnl'] > 0])
-        losing_trades = len([t for t in all_trades if t['pnl'] < 0])
-        
-        print(f"Total Trades: {total_trades}")
-        print(f"Winning Trades: {winning_trades}")
-        print(f"Losing Trades: {losing_trades}")
-        print(f"Win Rate: {(winning_trades/total_trades*100):.1f}%" if total_trades > 0 else "N/A")
-        print(f"Gross P&L: ${total_pnl:,.2f}")
-        print(f"Avg P&L per Trade: ${np.mean([t['pnl'] for t in all_trades]) if all_trades else 0:,.2f}")
-        print()
         
         # By commodity
-        print("By Commodity:")
-        for ticker, result in sorted(all_results.items()):
-            print(f"  {ticker}: {result['total_trades']} trades, ${result['gross_pnl']:,.2f} P&L")
+        print("\nBy Commodity:")
+        trades_df = pd.DataFrame(self.trades)
+        for commodity in trades_df['commodity'].unique():
+            comm_trades = trades_df[trades_df['commodity'] == commodity]
+            print(f"  {commodity}: {len(comm_trades)} trades, ${comm_trades['pnl'].sum():,.0f} P&L")
         
-        print("=" * 80)
-        
-        return {
-            'by_commodity': all_results,
-            'total_trades': total_trades,
-            'winning_trades': winning_trades,
-            'losing_trades': losing_trades,
-            'gross_pnl': total_pnl,
-            'all_trades': all_trades,
-        }
+        print("\n" + "=" * 80)
 
 
 if __name__ == '__main__':
+    # Example usage
+    from data_fetcher import DataFetcher
+    from signals import TurtleSignals
+    
+    print("=" * 80)
+    print("🦞 Running Backtest on 5 Years of Data")
+    print("=" * 80)
+    
+    # Fetch data
+    fetcher = DataFetcher()
+    raw_data = fetcher.fetch_all_commodities(years=5, exclude=['NG=F'])
+    
+    # Generate signals
+    signals_dict = {}
+    for commodity, data in raw_data.items():
+        sig = TurtleSignals(data)
+        sig.generate_full_signals()
+        signals_dict[commodity] = sig
+    
     # Run backtest
-    backtester = TurtleBacktester(account_size=1000000, risk_percent=2.0)
-    
-    tickers = ['CL=F', 'GC=F', 'ZS=F', 'ZC=F', 'SI=F', 'HG=F']
-    
-    results = backtester.backtest_portfolio(tickers, years=10, exclude_tickers=['NG=F'])
+    bt = TurtleBacktester(signals_dict, account_size=1_000_000, risk_percent=2.0)
+    bt.backtest()
+    bt.print_summary()
